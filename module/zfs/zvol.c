@@ -48,6 +48,7 @@
 #include <sys/zvol.h>
 #include <linux/blkdev_compat.h>
 
+unsigned int zvol_volmode = ZFS_VOLMODE_GEOM;
 unsigned int zvol_inhibit_dev = 0;
 unsigned int zvol_major = ZVOL_MAJOR;
 unsigned int zvol_prefetch_bytes = (128 * 1024);
@@ -1198,7 +1199,7 @@ static struct block_device_operations zvol_ops = {
  * request queue and generic disk structures for the block device.
  */
 static zvol_state_t *
-zvol_alloc(dev_t dev, const char *name)
+zvol_alloc(dev_t dev, const char *name, boolean_t suppress_partition)
 {
 	zvol_state_t *zv;
 
@@ -1237,6 +1238,10 @@ zvol_alloc(dev_t dev, const char *name)
 	zv->zv_disk->fops = &zvol_ops;
 	zv->zv_disk->private_data = zv;
 	zv->zv_disk->queue = zv->zv_queue;
+	if (suppress_partition == B_TRUE) {
+		printk("ZFS: Setting GENHD_FL_SUPPRESS_PARTITION_INFO on %s", name);
+		zv->zv_disk->flags |= GENHD_FL_SUPPRESS_PARTITION_INFO;
+	}
 	snprintf(zv->zv_disk->disk_name, DISK_NAME_LEN, "%s%d",
 	    ZVOL_DEV_NAME, (dev & MINORMASK));
 
@@ -1290,7 +1295,8 @@ __zvol_snapdev_hidden(const char *name)
 }
 
 static int
-__zvol_create_minor(const char *name, boolean_t ignore_snapdev)
+__zvol_create_minor(const char *name, boolean_t ignore_snapdev,
+ 	boolean_t suppress_partition)
 {
 	zvol_state_t *zv;
 	objset_t *os;
@@ -1332,7 +1338,7 @@ __zvol_create_minor(const char *name, boolean_t ignore_snapdev)
 	if (error)
 		goto out_dmu_objset_disown;
 
-	zv = zvol_alloc(MKDEV(zvol_major, minor), name);
+	zv = zvol_alloc(MKDEV(zvol_major, minor), name, suppress_partition);
 	if (zv == NULL) {
 		error = SET_ERROR(EAGAIN);
 		goto out_dmu_objset_disown;
@@ -1403,12 +1409,12 @@ out:
  * device is live and ready for use.
  */
 int
-zvol_create_minor(const char *name)
+zvol_create_minor(const char *name, boolean_t suppress_partition)
 {
 	int error;
 
 	mutex_enter(&zvol_state_lock);
-	error = __zvol_create_minor(name, B_FALSE);
+	error = __zvol_create_minor(name, B_FALSE, suppress_partition);
 	mutex_exit(&zvol_state_lock);
 
 	return (SET_ERROR(error));
@@ -1476,7 +1482,24 @@ __zvol_rename_minor(zvol_state_t *zv, const char *newname)
 static int
 zvol_create_minors_cb(const char *dsname, void *arg)
 {
-	(void) zvol_create_minor(dsname);
+	uint64_t volmode;
+
+	int error = dsl_prop_get_integer(dsname,
+		zfs_prop_to_name(ZFS_PROP_VOLMODE), &volmode, NULL);
+	if (error != 0 || volmode == ZFS_VOLMODE_DEFAULT)
+		volmode = zvol_volmode;
+
+	switch (volmode) {
+		case ZFS_VOLMODE_GEOM:
+			(void) zvol_create_minor(dsname, B_FALSE);
+			break;
+		case ZFS_VOLMODE_DEV:
+			(void) zvol_create_minor(dsname, B_TRUE);
+			break;
+		case ZFS_VOLMODE_NONE:
+			default:
+			break;
+	}
 
 	return (0);
 }
@@ -1566,6 +1589,7 @@ zvol_rename_minors(const char *oldname, const char *newname)
 static int
 snapdev_snapshot_changed_cb(const char *dsname, void *arg) {
 	uint64_t snapdev = *(uint64_t *) arg;
+	uint64_t parent_volmode = *(uint64_t *) arg + 1;
 
 	if (strchr(dsname, '@') == NULL)
 		return (0);
@@ -1573,7 +1597,7 @@ snapdev_snapshot_changed_cb(const char *dsname, void *arg) {
 	switch (snapdev) {
 		case ZFS_SNAPDEV_VISIBLE:
 			mutex_enter(&zvol_state_lock);
-			(void) __zvol_create_minor(dsname, B_TRUE);
+			(void) __zvol_create_minor(dsname, B_TRUE, parent_volmode);
 			mutex_exit(&zvol_state_lock);
 			break;
 		case ZFS_SNAPDEV_HIDDEN:
@@ -1586,9 +1610,44 @@ snapdev_snapshot_changed_cb(const char *dsname, void *arg) {
 
 int
 zvol_set_snapdev(const char *dsname, uint64_t snapdev) {
+	uint64_t args[2];
+	uint64_t volmode;
+
+	int error = dsl_prop_get_integer(dsname,
+		zfs_prop_to_name(ZFS_PROP_VOLMODE), &volmode, NULL);
+	if (error != 0 || volmode == ZFS_VOLMODE_DEFAULT)
+		volmode = zvol_volmode;
+
+	args[0] = snapdev;
+	args[1] = volmode;
+
 	(void) dmu_objset_find((char *) dsname, snapdev_snapshot_changed_cb,
-		&snapdev, DS_FIND_SNAPSHOTS | DS_FIND_CHILDREN);
-	/* caller should continue to modify snapdev property */
+		&args, DS_FIND_SNAPSHOTS | DS_FIND_CHILDREN);	/* caller should continue to modify snapdev property */
+
+	return (-1);
+}
+
+int
+zvol_set_volmode(const char *dsname, uint64_t volmode) {
+	if (volmode == ZFS_VOLMODE_DEFAULT)
+		volmode = zvol_volmode;
+
+	switch (volmode) {
+		case ZFS_VOLMODE_GEOM:
+			zvol_remove_minor(dsname);
+			(void) zvol_create_minor(dsname, B_FALSE);
+			break;
+		case ZFS_VOLMODE_DEV:
+			zvol_remove_minor(dsname);
+			(void) zvol_create_minor(dsname, B_TRUE);
+			break;
+		case ZFS_VOLMODE_NONE:
+		default:
+			zvol_remove_minor(dsname);
+			break;
+	}
+
+	/* caller should continue to modify volmode property */
 	return (-1);
 }
 
@@ -1632,6 +1691,9 @@ zvol_fini(void)
 
 module_param(zvol_inhibit_dev, uint, 0644);
 MODULE_PARM_DESC(zvol_inhibit_dev, "Do not create zvol device nodes");
+
+module_param(zvol_volmode, uint, 0644);
+MODULE_PARM_DESC(zvol_volmode, "Default volmode for zvols");
 
 module_param(zvol_major, uint, 0444);
 MODULE_PARM_DESC(zvol_major, "Major number for zvol device");
